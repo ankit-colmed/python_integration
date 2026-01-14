@@ -41,12 +41,43 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
   String _statusMessage = 'Select an image to get started';
   List<String> _processLogs = [];
 
-  /// Dynamically locate the Python executable in the app's bundle
+  // Cache the Python executable path to avoid repeated lookups
+  String? _cachedPythonPath;
+
+  // Limit log entries to prevent unbounded memory growth
+  static const int _maxLogEntries = 50;
+
+  @override
+  void dispose() {
+    _cleanupTempFiles();
+    super.dispose();
+  }
+
+  /// Clean up temporary processed images to free memory
+  Future<void> _cleanupTempFiles() async {
+    try {
+      if (_processedImage != null && await _processedImage!.exists()) {
+        await _processedImage!.delete();
+      }
+    } catch (e) {
+      // Silently handle cleanup errors
+      debugPrint('Error cleaning up temp files: $e');
+    }
+  }
+
+  /// Dynamically locate the Python executable in the app's bundle (with caching)
   Future<String> _getPythonExecutablePath() async {
+    // Return cached path if available
+    if (_cachedPythonPath != null) {
+      return _cachedPythonPath!;
+    }
+
     // Determine the executable name based on platform
     String execName = Platform.isWindows
         ? 'image_processor.exe'
         : 'image_processor';
+
+    String? foundPath;
 
     // In debug mode, assets are in the project's asset folder
     // In release mode, they're bundled with the app
@@ -62,19 +93,19 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
       );
 
       if (await File(exePath).exists()) {
-        return exePath;
-      }
+        foundPath = exePath;
+      } else {
+        // Fallback for debug mode
+        final debugPath = path.join(
+          Directory.current.path,
+          'assets',
+          'python_processor',
+          execName,
+        );
 
-      // Fallback for debug mode
-      final debugPath = path.join(
-        Directory.current.path,
-        'assets',
-        'python_processor',
-        execName,
-      );
-
-      if (await File(debugPath).exists()) {
-        return debugPath;
+        if (await File(debugPath).exists()) {
+          foundPath = debugPath;
+        }
       }
     } else if (Platform.isMacOS) {
       // macOS: executable is in Contents/Frameworks/App.framework/Resources/flutter_assets/assets/python_processor/
@@ -91,26 +122,32 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
       );
 
       if (await File(exePath).exists()) {
-        return exePath;
-      }
+        foundPath = exePath;
+      } else {
+        // Fallback for debug mode
+        final debugPath = path.join(
+          Directory.current.path,
+          'assets',
+          'python_processor',
+          execName,
+        );
 
-      // Fallback for debug mode
-      final debugPath = path.join(
-        Directory.current.path,
-        'assets',
-        'python_processor',
-        execName,
-      );
-
-      if (await File(debugPath).exists()) {
-        return debugPath;
+        if (await File(debugPath).exists()) {
+          foundPath = debugPath;
+        }
       }
     }
 
-    throw Exception(
-        'Python executable not found. Expected at one of the standard bundle locations.\n'
-            'Make sure "$execName" is in assets/python_processor/ and listed in pubspec.yaml'
-    );
+    if (foundPath == null) {
+      throw Exception(
+          'Python executable not found. Expected at one of the standard bundle locations.\n'
+              'Make sure "$execName" is in assets/python_processor/ and listed in pubspec.yaml'
+      );
+    }
+
+    // Cache the path for future use
+    _cachedPythonPath = foundPath;
+    return foundPath;
   }
 
   /// Pick an image file using file_picker
@@ -122,9 +159,12 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
       );
 
       if (result != null && result.files.single.path != null) {
+        // Clean up previous processed image before loading new one
+        await _cleanupTempFiles();
+
         setState(() {
           _originalImage = File(result.files.single.path!);
-          _processedImage = null; // Clear previous result
+          _processedImage = null;
           _statusMessage = 'Image selected. Ready to process.';
           _processLogs.clear();
         });
@@ -148,7 +188,10 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
     });
 
     try {
-      // 1. Locate the Python executable
+      // Clean up any previous processed image
+      await _cleanupTempFiles();
+
+      // 1. Locate the Python executable (uses cache if available)
       final execPath = await _getPythonExecutablePath();
       _addLog('✓ Found Python executable: $execPath');
 
@@ -199,18 +242,19 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
         throw Exception('Process failed (exit code ${result.exitCode}): $displayError');
       }
 
-      // 6. Parse stdout logs
+      // 6. Parse stdout logs (efficiently)
       final stdout = result.stdout.toString();
       final lines = stdout.split('\n').where((line) => line.trim().isNotEmpty);
 
       for (final line in lines) {
         try {
-          final log = jsonDecode(line);
+          final log = jsonDecode(line) as Map<String, dynamic>;
           _addLog('${log['status'].toString().toUpperCase()}: ${log['message']}');
 
           if (log['status'] == 'success' && log['details'] != null) {
-            _addLog('  → Dimensions: ${log['details']['dimensions']}');
-            _addLog('  → File size: ${log['details']['file_size_mb']} MB');
+            final details = log['details'] as Map<String, dynamic>;
+            _addLog('  → Dimensions: ${details['dimensions']}');
+            _addLog('  → File size: ${details['file_size_mb']} MB');
           }
         } catch (_) {
           _addLog(line);
@@ -240,6 +284,12 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
   void _addLog(String message) {
     setState(() {
       _processLogs.add(message);
+
+      // Limit log entries to prevent memory growth
+      if (_processLogs.length > _maxLogEntries) {
+        _processLogs.removeRange(0, _processLogs.length - _maxLogEntries);
+      }
+
       _statusMessage = message;
     });
   }
@@ -248,6 +298,11 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
     setState(() {
       _statusMessage = 'Error: $message';
       _processLogs.add('❌ $message');
+
+      // Apply log limit here too
+      if (_processLogs.length > _maxLogEntries) {
+        _processLogs.removeRange(0, _processLogs.length - _maxLogEntries);
+      }
     });
 
     ScaffoldMessenger.of(context).showSnackBar(
@@ -377,7 +432,18 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
                 color: Colors.grey.shade900,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: ListView.builder(
+              child: _processLogs.isEmpty
+                  ? const Center(
+                child: Text(
+                  'Logs will appear here',
+                  style: TextStyle(
+                    color: Colors.grey,
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                  ),
+                ),
+              )
+                  : ListView.builder(
                 itemCount: _processLogs.length,
                 itemBuilder: (context, index) {
                   return Padding(
@@ -429,6 +495,30 @@ class _ImageProcessorPageState extends State<ImageProcessorPage> {
               child: Image.file(
                 imageFile,
                 fit: BoxFit.contain,
+                // Important: Use cacheWidth/cacheHeight to reduce memory for large images
+                cacheWidth: 800, // Adjust based on your UI needs
+                errorBuilder: (context, error, stackTrace) {
+                  return Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.error_outline,
+                          size: 48,
+                          color: Colors.red.shade300,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Failed to load image',
+                          style: TextStyle(
+                            color: Colors.red.shade700,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
             )
                 : Center(

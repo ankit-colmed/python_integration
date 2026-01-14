@@ -28,7 +28,6 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/python_processor/
     - assets/python_processor/image_processor.exe  # Windows
 
 
